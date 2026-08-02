@@ -1,0 +1,2 @@
+# SPAD512-SCOS_GUI
+A GUI to use SPAD512 by PI-Imaging
