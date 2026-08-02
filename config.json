@@ -1,0 +1,8 @@
+{
+  "gate_offsets": {
+    "tpsf": 28743.0,
+    "irf": 28594.199999999997,
+    "tpsf_steps": 968,
+    "irf_steps": 968
+  }
+}
