@@ -16,15 +16,19 @@ warnings.filterwarnings('ignore')
 
 # Assuming SCOS_Calculation is in a local file scos_calculation.py
 try:
-    from scos_calculation import SCOS_Calculation
+    from scos_calculation import SCOS_Calculation, find_mask
 except ImportError:
-    # Fallback for environment verification
     def SCOS_Calculation(*args, **kwargs):
         print("Warning: scos_calculation module not found.")
         return {}
-
+    def find_mask(*args, **kwargs):
+        print("Warning: scos_calculation module not found.")
+        return None
+    
 import numpy as np
 
+
+MASTER_ONLY = False  # set True to restrict every recalculated ROI mask to the master-SPAD half of the sensor
 
 class SNRCalculator:
     """
@@ -212,20 +216,29 @@ class SNRCalculator:
     #     }
 
 class SCOSAnalyzer:
-    def __init__(self, base_path, output_csv='scos_analysis_results.csv', recalc_SCOS=False):
+    def __init__(self, base_path, output_csv='scos_analysis_results.csv', recalc_SCOS=False, master_only=None):
         self.base_path = Path(base_path)
         self.output_csv = output_csv
         self.results = []
         self.recalc_SCOS = recalc_SCOS
+        self.master_only = MASTER_ONLY if master_only is None else master_only
         self.snr_calc = SNRCalculator()
-        # Mapping metrics to user requested labels
         self.metric_map = {
             'K2_raw': 'raw',
             'K2_corrected': 'corrected',
             'BFi': 'BFi',
             'intensity': 'intensity'
         }
-
+        self.mask=None  # Initialize mask to None; will be computed when needed
+    @staticmethod
+    def apply_master_only_mask(mask, master_only=MASTER_ONLY):
+        """Restrict a mask to the master-SPAD half of the sensor (left half of columns)."""
+        if not master_only or mask is None:
+            return mask
+        master_mask = np.zeros_like(mask, dtype=bool)
+        master_mask[:mask.shape[1] // 2, :] = True  # columns, not rows
+        return mask & master_mask
+    
     def extract_power_level(self, name):
         """Extract power level string (e.g., -30%) from folder name."""
         match = re.search(r'([-+]?[0-9]+%|[0-9]+p[0-9]+%)', name)
@@ -240,9 +253,9 @@ class SCOSAnalyzer:
             if candidates: return candidates[0]
         
         all_tpsf = list(self.base_path.glob('TPSF_*'))
-        if len(all_tpsf) == 1: return all_tpsf[0]
+        if all_tpsf: return all_tpsf[0]
         all_tpsf_recursive = list(self.base_path.rglob('TPSF_*'))
-        if len(all_tpsf_recursive) == 1: return all_tpsf_recursive[0]
+        if all_tpsf_recursive: return all_tpsf_recursive[0]
         return None
 
     def get_peak_ns_from_metadata(self, folder_path):
@@ -317,42 +330,59 @@ class SCOSAnalyzer:
     def process_scos_scan(self, folder_path, force_recalc=False):
         power_level = self.extract_power_level(folder_path.name)
         print(f"\nProcessing Gated SCOS: {folder_path.name}")
-        
+
         try:
             if force_recalc:
-                print("    Recalculating SCOS metrics...")
                 image_data = self.load_npy(folder_path, 'image_data.npy')
+                image_data = np.asarray(image_data)
+                if image_data.dtype == object:
+                    image_data = image_data.astype(float)  # coerce object-dtype 4D arrays
+
                 gate_offsets = self.load_npy(folder_path, 'gate_offsets.npy', allow_none=True)
-                mask = self.load_npy(folder_path, 'roi_mask.npy', allow_none=True)
+                metadata = self.load_metadata(folder_path)
                 backgroundImg = self.load_npy(folder_path, 'backgroundImg.npy', allow_none=True)
                 darkVarPerWindow = self.load_npy(folder_path, 'darkVarPerWindow.npy', allow_none=True)
-                metadata = self.load_metadata(folder_path)
-                
+
                 n_offsets = image_data.shape[0] if image_data.ndim == 4 else 1
+
+                if self.mask is None:  # Compute mask once, from the first offset's mean frame
+                    representative_stack = image_data[0] if image_data.ndim == 4 else image_data
+                    mean_image = np.mean(representative_stack, axis=2)
+                    mask = find_mask(mean_image)
+                    mask = self.apply_master_only_mask(mask, self.master_only)
+                    self.mask = mask
+                else:
+                    mask = self.mask
+
+                self.save_npy(folder_path, 'roi_mask.npy', mask)
+                print(f"    Recomputed ROI mask: {mask.sum()} / {mask.size} pixels"
+                    f"{' (MASTER_ONLY)' if self.master_only else ''}")
+
                 all_time, all_k2_raw, all_k2_corr, all_BFi, all_int = [], [], [], [], []
-                
+
                 for i in range(n_offsets):
                     stack = image_data[i] if image_data.ndim == 4 else image_data
-                    print(f"Loaded image data = {stack.shape}, mask shape = {mask.shape if mask is not None else 'N/A'}, backgroundImg shape = {backgroundImg.shape if backgroundImg is not None or any(backgroundImg) else 'N/A'}, darkVarPerWindow shape = {darkVarPerWindow.shape if darkVarPerWindow is not None or any(darkVarPerWindow) else 'N/A'}")
-                    # print(f"mean backgroundImg: {np.mean(backgroundImg) if backgroundImg is not None else 'N/A'}, mean darkVarPerWindow: {np.mean(darkVarPerWindow) if darkVarPerWindow is not None else 'N/A'}")
+                    print(f"    Offset {i+1}/{n_offsets}: stack={stack.shape}, mask pixels={mask.sum()}, "
+                        f"backgroundImg={backgroundImg.shape if backgroundImg is not None else 'N/A'}, "
+                        f"darkVarPerWindow={darkVarPerWindow.shape if darkVarPerWindow is not None else 'N/A'}")
 
                     res = SCOS_Calculation(
-                        image_data=stack,
+                        image_data=stack,               # <-- now a proper 3D (H, W, n_frames) stack
                         camera_gain=metadata.get('gain', 1.0),
-                        mask=mask if mask is not None else np.ones(stack.shape[:2], dtype=bool),
+                        mask=mask,                       # <-- 2D mask now matches a 3D stack correctly
                         black_level=0,
                         frame_rate=metadata.get('frame_rate', 100.0),
+                        nBits=metadata.get('bit_depth', 8),
+                        is_pileup=metadata.get('is_pileup_correction', False),
                         backgroundImg=backgroundImg if backgroundImg is not None else 0,
                         darkVarPerWindow=darkVarPerWindow if darkVarPerWindow is not None else 0,
-                        nBits=metadata.get('bit_depth', 8),
-                        is_pileup=metadata.get('is_pileup_correction', False)
                     )
                     all_time.append(res['time_vector'])
                     all_k2_raw.append(res['K2_raw'])
                     all_k2_corr.append(res['K2_corrected'])
                     all_BFi.append(res.get('BFi', None))
                     all_int.append(np.mean(stack, axis=(0, 1)))
-                
+
                 self.save_npy(folder_path, 'time_vector.npy', np.array(all_time, dtype=object))
                 self.save_npy(folder_path, 'K2_raw.npy', np.array(all_k2_raw, dtype=object))
                 self.save_npy(folder_path, 'K2_corrected.npy', np.array(all_k2_corr, dtype=object))
@@ -435,10 +465,18 @@ class SCOSAnalyzer:
                 print(f"    IRF folder: {irf_folder}, TPSF folder: {tpsf_folder}")
             if force_recalc:
                 image_data = self.load_npy(folder_path, 'image_data.npy')
-                mask = self.load_npy(folder_path, 'roi_mask.npy', allow_none=True)
                 metadata = self.load_metadata(folder_path)
                 backgroundImg = self.load_npy(folder_path, 'backgroundImg.npy', allow_none=True)
                 darkVarPerWindow = self.load_npy(folder_path, 'darkVarPerWindow.npy', allow_none=True)
+                if self.mask is None:  # Compute mask only if it hasn't been computed yet
+                    mask = find_mask(np.mean(image_data, axis=2))
+                    mask = self.apply_master_only_mask(mask, self.master_only)
+                    self.mask = mask
+                else:
+                    mask = self.mask
+                self.save_npy(folder_path, 'roi_mask.npy', mask)
+                print(f"    Recomputed ROI mask: {mask.sum()} / {mask.size} pixels"
+                    f"{' (MASTER_ONLY)' if self.master_only else ''}")
                 print(f"Loaded image data = {image_data.shape}, mask shape = {mask.shape if mask is not None else 'N/A'}, backgroundImg shape = {backgroundImg.shape if backgroundImg is not None or any(backgroundImg) else 'N/A'}, darkVarPerWindow shape = {darkVarPerWindow.shape if darkVarPerWindow is not None or any(darkVarPerWindow) else 'N/A'}")
                 # print(f"mean backgroundImg: {np.mean(backgroundImg) if backgroundImg is not None else 'N/A'}, mean darkVarPerWindow: {np.mean(darkVarPerWindow) if darkVarPerWindow is not None else 'N/A'}")
                 res = SCOS_Calculation(
@@ -525,9 +563,15 @@ if __name__ == '__main__':
     import sys
     base_path = sys.argv[1] if len(sys.argv) > 1 else "."
     recalc_SCOS = '--recalc' in sys.argv
+    master_only = '--master-only' in sys.argv
     output_csv = str(Path(base_path) / 'scos_analysis_results.csv')
     
-    analyzer = SCOSAnalyzer(base_path, output_csv=output_csv, recalc_SCOS=recalc_SCOS)
+    print(f"Starting SCOS analysis in: {base_path}")
+    if recalc_SCOS:
+        print("Recalculation of SCOS metrics is ENABLED")
+    if master_only:
+        print("MASTER_ONLY mode is ENABLED (restricting ROI to master-SPAD half)")
+    analyzer = SCOSAnalyzer(base_path, output_csv=output_csv, recalc_SCOS=recalc_SCOS, master_only=master_only)
     analyzer.run()
     
     

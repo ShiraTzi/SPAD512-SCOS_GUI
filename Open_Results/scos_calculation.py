@@ -344,8 +344,7 @@ def find_mask(mean_img, threshold=0.1):
     Y, X = np.ogrid[:mean_img.shape[0], :mean_img.shape[1]]
     dist_from_center = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
     mask = dist_from_center <= radius
-    square_mask = square_roi_from_mask(mask)
-    return square_mask
+    return mask
 
 def square_roi_from_mask(mask):
     """Extract inscribed square ROI from circular mask."""

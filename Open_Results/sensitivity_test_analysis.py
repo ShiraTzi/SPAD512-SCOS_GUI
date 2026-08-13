@@ -1,10 +1,45 @@
 """
 Sensitivity test analysis for SCOS_Single measurements.
 
-This script compares the first 30 s baseline against the last 30 s
-tourniquet segment using corrected rBFI, defined as 1 / K^2_corrected.
+This script compares a baseline segment against a tourniquet segment
+(and, optionally, a post-release "late" segment) using corrected rBFI,
+defined as 1 / K^2_corrected, or the raw contrast (sqrt(K2_corrected)).
+
 It records the time gate relative to the experiment's gate-1 reference
 and the coherence gate relative to the matched IRF peak for ref/late rows.
+
+This is a merge of the previous two-stage and three-stage sensitivity
+scripts, with two new options:
+
+* stages=2 or stages=3
+    - base and tourniquet segments are ALWAYS present.
+    - stages=2: the tourniquet segment is the last `window_seconds`
+      of the recording (this is the behavior of the original
+      "two-stage" script).
+    - stages=3: the tourniquet segment is a *middle* window (padded by
+      `window_cut_transition_seconds` on either side), and a separate
+      post-release "late" segment (the last `window_seconds` of the
+      recording) is also computed (this is the behavior of the
+      original "three-stage" script).
+
+* correct_intensity=True/False (default False)
+    - When True, an intensity-artifact correction (derived from the
+      Gated measurements, then interpolated across gate/coherence
+      offsets for ISCOS/PaLS-iSCOS) is applied to the tourniquet
+      window's contrast/rBFI, exactly as in the original three-stage
+      script's calibration pass.
+    - When False (default), no correction is applied
+      (contrast_multiplier = rbfi_multiplier = 1.0), matching the
+      original two-stage script's behavior.
+
+ROI handling
+------------
+Same fix as `scos_analysis.py`: instead of trusting a (possibly stale)
+`roi_mask.npy` saved on disk, the mask is recomputed directly from the
+image data via `find_mask()` whenever `--recalc` is used. The mask is
+computed once per run (from the first folder that needs it) and reused
+for every subsequent folder, since all measurements share the same
+physical camera field of view.
 """
 
 import json
@@ -18,24 +53,58 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+# Assuming SCOS_Calculation / find_mask are in a local file scos_calculation.py
 try:
-    from scos_calculation import SCOS_Calculation
+    from scos_calculation import SCOS_Calculation, find_mask
 except ImportError:
     def SCOS_Calculation(*args, **kwargs):
         print("Warning: scos_calculation module not found.")
         return {}
+    def find_mask(*args, **kwargs):
+        print("Warning: scos_calculation module not found.")
+        return None
+
+
+MASTER_ONLY = False  # set True to restrict every recalculated ROI mask to the master-SPAD half of the sensor
 
 
 class SensitivityTestAnalyzer:
-    def __init__(self, base_path, output_csv="sensitivity_test_results.csv", recalc_SCOS=False, window_seconds=30.0, metric="contrast"):
+    def __init__(
+        self,
+        base_path,
+        output_csv="sensitivity_test_results.csv",
+        recalc_SCOS=False,
+        window_seconds=30.0,
+        metric="contrast",
+        stages=2,
+        correct_intensity=False,
+        window_cut_transition_seconds=5.0,
+        master_only=None,
+    ):
         self.base_path = Path(base_path)
         self.output_csv = output_csv
         self.recalc_SCOS = recalc_SCOS
         self.window_seconds = float(window_seconds)
+        self.window_cut_transition_seconds = float(window_cut_transition_seconds)
         self.results = []
         self._time_gate_reference_ps = None
         self.metric = str(metric).lower() if metric is not None else "contrast"
 
+        if int(stages) not in (2, 3):
+            raise ValueError("stages must be 2 or 3")
+        self.stages = int(stages)
+        self.correct_intensity = bool(correct_intensity)
+
+        # ROI mask cache, computed once per run and reused across folders (see fix above)
+        self.mask = None
+        self.master_only = MASTER_ONLY if master_only is None else master_only
+
+        # Intensity-artifact calibration model (only populated if correct_intensity=True)
+        self.gated_baseline_model = None
+
+    # ------------------------------------------------------------------ #
+    # Generic I/O helpers
+    # ------------------------------------------------------------------ #
     def load_metadata(self, folder_path):
         metadata_path = folder_path / "metadata.json"
         if metadata_path.exists():
@@ -57,6 +126,18 @@ class SensitivityTestAnalyzer:
     def find_measurement_folders(self):
         return sorted([folder for folder in self.base_path.rglob("SCOS_Single_*") if folder.is_dir()])
 
+    @staticmethod
+    def apply_master_only_mask(mask, master_only=MASTER_ONLY):
+        """Restrict a mask to the master-SPAD half of the sensor (left half of columns)."""
+        if not master_only or mask is None:
+            return mask
+        master_mask = np.zeros_like(mask, dtype=bool)
+        master_mask[:mask.shape[1] // 2, :] = True  # columns, not rows
+        return mask & master_mask
+
+    # ------------------------------------------------------------------ #
+    # Folder / metadata matching helpers
+    # ------------------------------------------------------------------ #
     def extract_power_level(self, text_value):
         match = re.search(r"(\d+(?:\.\d+)?%)", str(text_value))
         return match.group(1) if match else None
@@ -246,6 +327,9 @@ class SensitivityTestAnalyzer:
         match = re.search(r"\b(\d+)\b", text)
         return int(match.group(1)) if match else None
 
+    # ------------------------------------------------------------------ #
+    # Signal-processing helpers
+    # ------------------------------------------------------------------ #
     def calculate_corrected_rbfi(self, corrected_contrast):
         corrected_contrast = np.asarray(corrected_contrast, dtype=float).flatten()
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -262,20 +346,20 @@ class SensitivityTestAnalyzer:
         normalized[~np.isfinite(normalized)] = np.nan
         return normalized
 
-    def summarize_window(self, rbfi, time_vec, start_s, end_s):
+    def summarize_window(self, values, time_vec, start_s, end_s):
         time_vec = np.asarray(time_vec, dtype=float).flatten()
-        rbfi = np.asarray(rbfi, dtype=float).flatten()
+        values = np.asarray(values, dtype=float).flatten()
 
-        if time_vec.size == 0 or rbfi.size == 0:
+        if time_vec.size == 0 or values.size == 0 or start_s is None or end_s is None:
             return {
                 "mean": np.nan,
                 "std": np.nan,
                 "count": 0,
-                "mask": np.zeros(0, dtype=bool),
+                "mask": np.zeros(time_vec.size, dtype=bool),
             }
 
         mask = (time_vec >= start_s) & (time_vec <= end_s)
-        window_values = rbfi[mask]
+        window_values = values[mask]
         window_values = window_values[np.isfinite(window_values)]
 
         return {
@@ -285,16 +369,160 @@ class SensitivityTestAnalyzer:
             "mask": mask,
         }
 
-    def plot_results(self, time_vec, rbfi, save_path, filename, title_suffix="", base_mask=None, late_mask=None):
+    def compute_stage_windows(self, time_vec):
+        """
+        Base and tourniquet windows are always computed. The 'late'
+        (post-release) window is only computed for stages=3.
+
+        stages=2: tourniquet = last `window_seconds` of the recording.
+        stages=3: tourniquet = a middle window padded on both sides by
+                  `window_cut_transition_seconds`; late = last
+                  `window_seconds` of the recording.
+        """
+        time_vec = np.asarray(time_vec, dtype=float).flatten()
+        start_time = float(time_vec[0])
+        end_time = float(time_vec[-1])
+
+        base_start = start_time
+        base_end = min(start_time + self.window_seconds, end_time)
+
+        if self.stages == 3:
+            tourniquet_start = base_end + self.window_cut_transition_seconds
+            tourniquet_end = min(
+                tourniquet_start + self.window_seconds - self.window_cut_transition_seconds,
+                end_time,
+            )
+            late_start = max(end_time - self.window_seconds + self.window_cut_transition_seconds, start_time)
+            late_end = end_time
+        else:
+            tourniquet_start = max(end_time - self.window_seconds, start_time)
+            tourniquet_end = end_time
+            late_start = None
+            late_end = None
+
+        return {
+            "base_start": base_start,
+            "base_end": base_end,
+            "tourniquet_start": tourniquet_start,
+            "tourniquet_end": tourniquet_end,
+            "late_start": late_start,
+            "late_end": late_end,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Intensity-artifact calibration (only used if correct_intensity=True)
+    # ------------------------------------------------------------------ #
+    def calibrate_intensity_artifact(self):
+        """
+        Pass 1: learn the intensity ratio R = tourniquet_I / base_I from
+        the Gated measurements, as a function of gate delay, so it can be
+        interpolated and applied to ISCOS/PaLS-iSCOS measurements later
+        (via their coherence gate) as well as to the Gated measurements
+        themselves.
+        """
+        print("\n[Pass 1] Calibrating intensity artifact from Gated measurements...")
+        time_gate_reference_ps = self.infer_time_gate_reference_ps()
+
+        gated_delays = []
+        gated_base_Is = []
+        gated_tourniquet_Is = []
+
+        for folder_path in self.find_measurement_folders():
+            if self.extract_method_label(folder_path) != "Gated":
+                continue
+
+            metadata = self.load_metadata(folder_path)
+            gate_position_ps = metadata.get("gate_position_ps")
+            if gate_position_ps is None or time_gate_reference_ps is None:
+                continue
+            time_gate_ps = round(float(gate_position_ps) - time_gate_reference_ps, 4)
+
+            time_vec = self.load_npy(folder_path, "time_vector.npy", allow_none=True)
+            intensity = self.load_npy(folder_path, "intensity.npy", allow_none=True)
+            if time_vec is None or intensity is None:
+                continue
+            time_vec = np.asarray(time_vec).flatten()
+            intensity = np.asarray(intensity).flatten()
+            if time_vec.size == 0 or intensity.size == 0:
+                continue
+
+            windows = self.compute_stage_windows(time_vec)
+            base_mask = (time_vec >= windows["base_start"]) & (time_vec < windows["base_end"])
+            tourniquet_mask = (time_vec >= windows["tourniquet_start"]) & (time_vec < windows["tourniquet_end"])
+
+            base_I = np.nanmean(intensity[base_mask]) if np.any(base_mask) else np.nan
+            tourniquet_I = np.nanmean(intensity[tourniquet_mask]) if np.any(tourniquet_mask) else np.nan
+            if not np.isfinite(base_I) or base_I == 0 or not np.isfinite(tourniquet_I):
+                continue
+
+            gated_delays.append(time_gate_ps)
+            gated_base_Is.append(base_I)
+            gated_tourniquet_Is.append(tourniquet_I)
+
+        if not gated_delays:
+            print("    No usable Gated measurements found; intensity correction will fall back to 1.0 (no correction).")
+            self.gated_baseline_model = None
+            return
+
+        from scipy.interpolate import interp1d
+
+        delays = np.array(gated_delays, dtype=float)
+        base_Is = np.array(gated_base_Is, dtype=float)
+        tourniquet_Is = np.array(gated_tourniquet_Is, dtype=float)
+
+        sorted_idx = np.argsort(delays)
+        delays_sorted = delays[sorted_idx]
+        base_Is_sorted = base_Is[sorted_idx]
+        tourniquet_Is_sorted = tourniquet_Is[sorted_idx]
+
+        unique_delays, unique_indices = np.unique(delays_sorted, return_index=True)
+        unique_base_Is = base_Is_sorted[unique_indices]
+        unique_tourniquet_Is = tourniquet_Is_sorted[unique_indices]
+        ratio = unique_tourniquet_Is / unique_base_Is
+
+        if len(unique_delays) > 1:
+            self.gated_baseline_model = interp1d(unique_delays, ratio, kind="linear", fill_value="extrapolate")
+        else:
+            constant_ratio = float(ratio[0])
+            self.gated_baseline_model = lambda x, _r=constant_ratio: _r
+
+        # save (rather than plt.show, which would block a batch run) a calibration plot
+        try:
+            output_parent = Path(self.output_csv).parent if self.output_csv else Path(self.base_path)
+            delay_range = np.linspace(min(unique_delays), max(unique_delays), 100)
+            interpolated_ratio = self.gated_baseline_model(delay_range)
+            plt.figure(figsize=(8, 5))
+            plt.plot(unique_delays, ratio, "o", label="Measured tourniquet/baseline intensity")
+            plt.plot(delay_range, interpolated_ratio, "-", label="Interpolated model")
+            plt.xlabel("Gate Position (ps)")
+            plt.ylabel("Intensity ratio (tourniquet / baseline)")
+            plt.title("Intensity artifact calibration")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(output_parent / "intensity_calibration.png", dpi=150, bbox_inches="tight")
+            plt.close()
+        except Exception as error:
+            print(f"    Warning: could not save calibration plot: {error}")
+
+        print(f"    Intensity artifact calibration complete ({len(unique_delays)} gate position(s)).")
+
+    # ------------------------------------------------------------------ #
+    # Plotting
+    # ------------------------------------------------------------------ #
+    def plot_results(self, time_vec, values, save_path, filename, title_suffix="", base_mask=None, tourniquet_mask=None, late_mask=None):
         try:
             fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-            ax.plot(time_vec, rbfi, color="navy", linewidth=1.4, label="Signal")
+            ax.plot(time_vec, values, color="navy", linewidth=1.4, label="Signal")
 
             if base_mask is not None and np.any(base_mask):
                 ax.axvspan(time_vec[base_mask][0], time_vec[base_mask][-1], color="seagreen", alpha=0.12, label="Base window")
 
+            if tourniquet_mask is not None and np.any(tourniquet_mask):
+                ax.axvspan(time_vec[tourniquet_mask][0], time_vec[tourniquet_mask][-1], color="darkorange", alpha=0.12, label="Tourniquet window")
+
             if late_mask is not None and np.any(late_mask):
-                ax.axvspan(time_vec[late_mask][0], time_vec[late_mask][-1], color="darkorange", alpha=0.12, label="Late window")
+                ax.axvspan(time_vec[late_mask][0], time_vec[late_mask][-1], color="lightblue", alpha=0.12, label="Late window")
 
             ax.set_title(f"{title_suffix}".strip())
             ax.set_xlabel("Time [s]")
@@ -309,6 +537,9 @@ class SensitivityTestAnalyzer:
         except Exception as error:
             print(f"    Error saving plot: {error}")
 
+    # ------------------------------------------------------------------ #
+    # Per-measurement processing
+    # ------------------------------------------------------------------ #
     def process_measurement(self, folder_path, force_recalc=False):
         folder_label = self.extract_folder_label(folder_path)
         measurement_type = self.extract_measurement_type(folder_path)
@@ -318,7 +549,11 @@ class SensitivityTestAnalyzer:
 
         try:
             metadata = self.load_metadata(folder_path)
-            power_level = self.extract_power_level(folder_label) or self.extract_power_level(folder_path.parent.name) or self.extract_power_level(folder_path.name)
+            power_level = (
+                self.extract_power_level(folder_label)
+                or self.extract_power_level(folder_path.parent.name)
+                or self.extract_power_level(folder_path.name)
+            )
 
             tpsf_folder = self.find_matching_tpsf(folder_path.parent, power_level=power_level)
             tpsf_peak_ps = self.get_peak_ps_from_metadata(tpsf_folder)
@@ -346,17 +581,32 @@ class SensitivityTestAnalyzer:
             tpsf_decon_peak_ps, tpsf_start_ps, tpsf_peak_ps = self.get_peak_components_from_arrays(tpsf_folder)
             irf_peak_offset_ps = self.get_metadata_decon_peak_ps(irf_folder)
             tpsf_peak_offset_ps = self.get_metadata_decon_peak_ps(tpsf_folder)
-            irf_metadata_peak_ps = self.get_metadata_decon_peak_ps(irf_folder)
-            tpsf_metadata_peak_ps = self.get_metadata_decon_peak_ps(tpsf_folder)
             coherence_gate_ps = None
             if method_label in {"ISCOS", "PaLS-iSCOS"} and irf_peak_ps is not None and tpsf_peak_ps is not None:
                 coherence_gate_ps = round(irf_peak_ps - tpsf_peak_ps, 4)
 
             if force_recalc:
                 image_data = self.load_npy(folder_path, "image_data.npy")
-                mask = self.load_npy(folder_path, "roi_mask.npy", allow_none=True)
                 background_img = self.load_npy(folder_path, "backgroundImg.npy", allow_none=True)
                 dark_var_per_window = self.load_npy(folder_path, "darkVarPerWindow.npy", allow_none=True)
+
+                # --- ROI fix (same as scos_analysis.py) ---
+                # Recompute the mask from the actual image data via find_mask()
+                # instead of trusting a possibly-stale roi_mask.npy on disk.
+                # Computed once per run and reused for every subsequent folder,
+                # since all measurements share the same physical camera FOV.
+                if self.mask is None:
+                    mean_image = np.mean(image_data, axis=2)
+                    mask = find_mask(mean_image)
+                    mask = self.apply_master_only_mask(mask, self.master_only)
+                    self.mask = mask
+                else:
+                    mask = self.mask
+                self.save_npy(folder_path, "roi_mask.npy", mask)
+                print(
+                    f"    Recomputed ROI mask: {mask.sum()} / {mask.size} pixels"
+                    f"{' (MASTER_ONLY)' if self.master_only else ''}"
+                )
 
                 res = SCOS_Calculation(
                     image_data=image_data,
@@ -378,29 +628,72 @@ class SensitivityTestAnalyzer:
 
             time_vec = np.asarray(self.load_npy(folder_path, "time_vector.npy")).flatten()
             k2_corrected = np.asarray(self.load_npy(folder_path, "K2_corrected.npy")).flatten()
-            # contrast is sqrt(K2)
-            with np.errstate(invalid='ignore'):
+            intensity_raw = self.load_npy(folder_path, "intensity.npy", allow_none=True)
+            intensity = np.asarray(intensity_raw).flatten() if intensity_raw is not None else None
+
+            with np.errstate(invalid="ignore"):
                 contrast = np.sqrt(np.maximum(k2_corrected.astype(float).flatten(), 0.0))
 
             if time_vec.size == 0 or contrast.size == 0:
                 raise ValueError("Missing time vector or contrast data")
 
-            start_time = float(time_vec[0])
-            end_time = float(time_vec[-1])
-            base_start = start_time
-            base_end = min(start_time + self.window_seconds, end_time)
-            late_end = end_time
-            late_start = max(end_time - self.window_seconds, start_time)
+            windows = self.compute_stage_windows(time_vec)
+            base_start, base_end = windows["base_start"], windows["base_end"]
+            tourniquet_start, tourniquet_end = windows["tourniquet_start"], windows["tourniquet_end"]
+            late_start, late_end = windows["late_start"], windows["late_end"]
+            has_late_stage = self.stages == 3
 
-            # compute raw summaries for both contrast and rBFI (rbfi = 1/contrast^2)
+            # --- optional intensity correction, applied only to the tourniquet window ---
+            contrast_multiplier = 1.0
+            rbfi_multiplier = 1.0
+            R = 1.0
+            if self.correct_intensity and intensity is not None:
+                base_mask_R = (time_vec >= base_start) & (time_vec < base_end)
+                tourniquet_mask_R = (time_vec >= tourniquet_start) & (time_vec < tourniquet_end)
+
+                if method_label == "Gated":
+                    # Gated SCOS uses the actual measured deviation
+                    base_I = np.nanmean(intensity[base_mask_R]) if np.any(base_mask_R) else np.nan
+                    tourniquet_I = np.nanmean(intensity[tourniquet_mask_R]) if np.any(tourniquet_mask_R) else np.nan
+                    if np.isfinite(base_I) and base_I != 0 and np.isfinite(tourniquet_I):
+                        R = tourniquet_I / base_I
+                    # Homodyne physics:
+                    contrast_multiplier = R
+                    rbfi_multiplier = 1.0 / (R ** 2) if R != 0 else 1.0
+
+                elif method_label in {"ISCOS", "PaLS-iSCOS"} and self.gated_baseline_model is not None:
+                    # ISCOS/PaLS-iSCOS require the interpolated sample-intensity model
+                    gate_to_query = coherence_gate_ps if coherence_gate_ps is not None else 0
+                    try:
+                        R = float(self.gated_baseline_model(gate_to_query))
+                    except Exception:
+                        R = 1.0  # fall back to no correction
+                    # Heterodyne physics:
+                    contrast_multiplier = np.sqrt(R) if R > 0 else 1.0
+                    rbfi_multiplier = 1.0 / R if R > 0 else 1.0
+
+                print(f"  Intensity correction ON — R={R:.6g}, contrast x{contrast_multiplier:.6g}, rBFI x{rbfi_multiplier:.6g}")
+
+            # --- raw (uncorrected) window summaries, for reference/QA ---
             base_contrast_summary = self.summarize_window(contrast, time_vec, base_start, base_end)
-            late_contrast_summary = self.summarize_window(contrast, time_vec, late_start, late_end)
+            tourniquet_contrast_summary = self.summarize_window(contrast * contrast_multiplier, time_vec, tourniquet_start, tourniquet_end)
+            late_contrast_summary = self.summarize_window(contrast, time_vec, late_start, late_end) if has_late_stage else None
 
             rbfi_raw = self.calculate_corrected_rbfi(contrast)
             base_rbfi_summary = self.summarize_window(rbfi_raw, time_vec, base_start, base_end)
-            late_rbfi_summary = self.summarize_window(rbfi_raw, time_vec, late_start, late_end)
+            tourniquet_rbfi_summary = self.summarize_window(rbfi_raw * rbfi_multiplier, time_vec, tourniquet_start, tourniquet_end)
+            late_rbfi_summary = self.summarize_window(rbfi_raw, time_vec, late_start, late_end) if has_late_stage else None
 
-            # choose metric for normalization and plotting
+            if intensity is not None:
+                base_intensity_summary = self.summarize_window(intensity, time_vec, base_start, base_end)
+                tourniquet_intensity_summary = self.summarize_window(intensity, time_vec, tourniquet_start, tourniquet_end)
+                late_intensity_summary = self.summarize_window(intensity, time_vec, late_start, late_end) if has_late_stage else None
+            else:
+                empty = {"mean": np.nan, "std": np.nan, "count": 0, "mask": np.zeros(0, dtype=bool)}
+                base_intensity_summary = tourniquet_intensity_summary = empty
+                late_intensity_summary = empty if has_late_stage else None
+
+            # --- normalized metric (drives percentage_difference + plot) ---
             if self.metric == "rbfi":
                 baseline_mean = base_rbfi_summary["mean"]
                 if not np.isfinite(baseline_mean) or baseline_mean == 0:
@@ -408,58 +701,54 @@ class SensitivityTestAnalyzer:
 
                 normalized = self.normalize_to_baseline(rbfi_raw, baseline_mean)
                 base_summary = self.summarize_window(normalized, time_vec, base_start, base_end)
-                late_summary = self.summarize_window(normalized, time_vec, late_start, late_end)
-                normalized_late_mean = late_summary["mean"]
-                normalized_late_std = late_summary["std"]
-                percentage_rbfi_difference = float((normalized_late_mean - 1.0) * 100.0) if np.isfinite(normalized_late_mean) else np.nan
+                tourniquet_summary = self.summarize_window(normalized * rbfi_multiplier, time_vec, tourniquet_start, tourniquet_end)
+                late_summary = self.summarize_window(normalized, time_vec, late_start, late_end) if has_late_stage else None
+
+                normalized_tourniquet_mean = tourniquet_summary["mean"]
+                normalized_tourniquet_std = tourniquet_summary["std"]
+                percentage_difference = float((normalized_tourniquet_mean - 1.0) * 100.0) if np.isfinite(normalized_tourniquet_mean) else np.nan
 
                 title_suffix = f"Normalized rBFI ({folder_label})"
                 plot_filename = f"{folder_path.name}_sensitivity_rbfi.png"
-                self.plot_results(
-                    time_vec,
-                    normalized,
-                    folder_path,
-                    plot_filename,
-                    title_suffix=title_suffix,
-                    base_mask=base_summary["mask"],
-                    late_mask=late_summary["mask"],
-                )
             else:
-                # default: contrast-based sensitivity
                 baseline_mean = base_contrast_summary["mean"]
                 if not np.isfinite(baseline_mean) or baseline_mean == 0:
                     raise ValueError("Invalid baseline mean contrast for normalization")
 
-                # normalize contrast by baseline mean
-                with np.errstate(divide='ignore', invalid='ignore'):
+                with np.errstate(divide="ignore", invalid="ignore"):
                     normalized = contrast / float(baseline_mean)
                 normalized[~np.isfinite(normalized)] = np.nan
 
                 base_summary = self.summarize_window(normalized, time_vec, base_start, base_end)
-                late_summary = self.summarize_window(normalized, time_vec, late_start, late_end)
+                tourniquet_summary = self.summarize_window(normalized * contrast_multiplier, time_vec, tourniquet_start, tourniquet_end)
+                late_summary = self.summarize_window(normalized, time_vec, late_start, late_end) if has_late_stage else None
 
-                normalized_late_mean = late_summary["mean"]
-                normalized_late_std = late_summary["std"]
-                percentage_rbfi_difference = float((normalized_late_mean - 1.0) * 100.0) if np.isfinite(normalized_late_mean) else np.nan
+                normalized_tourniquet_mean = tourniquet_summary["mean"]
+                normalized_tourniquet_std = tourniquet_summary["std"]
+                percentage_difference = float((normalized_tourniquet_mean - 1.0) * 100.0) if np.isfinite(normalized_tourniquet_mean) else np.nan
 
                 title_suffix = f"Normalized contrast ({folder_label})"
                 plot_filename = f"{folder_path.name}_sensitivity_contrast.png"
-                self.plot_results(
-                    time_vec,
-                    normalized,
-                    folder_path,
-                    plot_filename,
-                    title_suffix=title_suffix,
-                    base_mask=base_summary["mask"],
-                    late_mask=late_summary["mask"],
-                )
 
-            self.results.append({
+            self.plot_results(
+                time_vec,
+                normalized,
+                folder_path,
+                plot_filename,
+                title_suffix=title_suffix,
+                base_mask=base_summary["mask"],
+                tourniquet_mask=tourniquet_summary["mask"],
+                late_mask=late_summary["mask"] if has_late_stage else None,
+            )
+
+            row = {
                 "folder": folder_label,
                 "folder_path": str(folder_path),
                 "method": method_label,
                 "measurement_type": measurement_type,
                 "measurement_index": measurement_index,
+                "stages": self.stages,
+                "correct_intensity": self.correct_intensity,
                 "gate_position_ps": gate_position_ps_value if gate_position_ps_value is not None else np.nan,
                 "tpsf_peak_ps": tpsf_peak_ps,
                 "irf_peak_ps": irf_peak_ps,
@@ -469,49 +758,61 @@ class SensitivityTestAnalyzer:
                 "time_gate_ps": time_gate_ps if time_gate_ps is not None else np.nan,
                 "coherence_gate_ps": coherence_gate_ps if coherence_gate_ps is not None else np.nan,
                 "window_seconds": self.window_seconds,
+                "window_cut_transition_seconds": self.window_cut_transition_seconds if has_late_stage else np.nan,
                 "base_start_s": base_start,
                 "base_end_s": base_end,
-                "late_start_s": late_start,
-                "late_end_s": late_end,
+                "tourniquet_start_s": tourniquet_start,
+                "tourniquet_end_s": tourniquet_end,
+                "late_start_s": late_start if late_start is not None else np.nan,
+                "late_end_s": late_end if late_end is not None else np.nan,
                 "baseline_mean_rBFI": base_summary["mean"],
                 "baseline_std_rBFI": base_summary["std"],
                 "base_count": base_summary["count"],
-                "tourniquet_mean_rBFI": normalized_late_mean,
-                "tourniquet_std_rBFI": normalized_late_std,
-                "late_count": late_summary["count"],
-                "percentage_rBFI_difference": percentage_rbfi_difference,
+                "tourniquet_mean_rBFI": normalized_tourniquet_mean,
+                "tourniquet_std_rBFI": normalized_tourniquet_std,
+                "tourniquet_count": tourniquet_summary["count"],
+                "late_mean_rBFI": late_summary["mean"] if has_late_stage else np.nan,
+                "late_std_rBFI": late_summary["std"] if has_late_stage else np.nan,
+                "late_count": late_summary["count"] if has_late_stage else np.nan,
+                "percentage_rBFI_difference": percentage_difference,
                 "raw_baseline_mean_contrast": base_contrast_summary["mean"],
                 "raw_baseline_std_contrast": base_contrast_summary["std"],
-                "raw_tourniquet_mean_contrast": late_contrast_summary["mean"],
-                "raw_tourniquet_std_contrast": late_contrast_summary["std"],
+                "raw_tourniquet_mean_contrast": tourniquet_contrast_summary["mean"],
+                "raw_tourniquet_std_contrast": tourniquet_contrast_summary["std"],
+                "raw_late_mean_contrast": late_contrast_summary["mean"] if has_late_stage else np.nan,
+                "raw_late_std_contrast": late_contrast_summary["std"] if has_late_stage else np.nan,
+                "raw_baseline_mean_intensity": base_intensity_summary["mean"],
+                "raw_baseline_std_intensity": base_intensity_summary["std"],
+                "raw_tourniquet_mean_intensity": tourniquet_intensity_summary["mean"],
+                "raw_tourniquet_std_intensity": tourniquet_intensity_summary["std"],
+                "raw_late_mean_intensity": late_intensity_summary["mean"] if has_late_stage else np.nan,
+                "raw_late_std_intensity": late_intensity_summary["std"] if has_late_stage else np.nan,
                 "raw_baseline_mean_rBFI": base_rbfi_summary["mean"],
                 "raw_baseline_std_rBFI": base_rbfi_summary["std"],
-                "raw_tourniquet_mean_rBFI": late_rbfi_summary["mean"],
-                "raw_tourniquet_std_rBFI": late_rbfi_summary["std"],
+                "raw_tourniquet_mean_rBFI": tourniquet_rbfi_summary["mean"],
+                "raw_tourniquet_std_rBFI": tourniquet_rbfi_summary["std"],
+                "raw_late_mean_rBFI": late_rbfi_summary["mean"] if has_late_stage else np.nan,
+                "raw_late_std_rBFI": late_rbfi_summary["std"] if has_late_stage else np.nan,
+                "intensity_ratio_R": R,
+                "correction_factor_rBFI": rbfi_multiplier,
+                "correction_factor_contrast": contrast_multiplier,
                 "metric": self.metric,
                 "total_frames": int(time_vec.size),
-            })
+                "baseline_mean_normalized": base_summary["mean"],
+                "baseline_std_normalized": base_summary["std"],
+                "tourniquet_mean_normalized": normalized_tourniquet_mean,
+                "tourniquet_std_normalized": normalized_tourniquet_std,
+            }
+            self.results.append(row)
 
             print(f"  Raw baseline contrast mean/std: {base_contrast_summary['mean']:.6g} / {base_contrast_summary['std']:.6g}")
-            print(f"  Normalized baseline contrast mean/std: {base_summary['mean']:.6g} / {base_summary['std']:.6g}")
-            print(f"  Normalized tourniquet contrast mean/std: {late_summary['mean']:.6g} / {late_summary['std']:.6g}")
-            print(f"  Percentage contrast difference: {percentage_rbfi_difference:.4f}%")
+            print(f"  Normalized baseline mean/std: {base_summary['mean']:.6g} / {base_summary['std']:.6g}")
+            print(f"  Normalized tourniquet mean/std: {tourniquet_summary['mean']:.6g} / {tourniquet_summary['std']:.6g}")
+            print(f"  Percentage difference (tourniquet vs baseline): {percentage_difference:.4f}%")
+            if has_late_stage and late_summary is not None and np.isfinite(late_summary["mean"]):
+                print(f"  Normalized late (post-release) mean/std: {late_summary['mean']:.6g} / {late_summary['std']:.6g}")
             if time_gate_ps is not None:
                 print(f"  Time gate difference: {time_gate_ps:.4f} ps")
-            # if time_gate_reference_ps is not None:
-            #     print(f"  Time gate reference: {time_gate_reference_ps:.4f} ps")
-            # if irf_peak_ps is not None and irf_decon_peak_ps is not None and irf_start_ps is not None:
-            #     print(f"  IRF decon peak + start: {irf_decon_peak_ps:.4f} + {irf_start_ps:.4f} = {irf_peak_ps:.4f} ps")
-            # if tpsf_peak_ps is not None and tpsf_decon_peak_ps is not None and tpsf_start_ps is not None:
-            #     print(f"  TPSF decon peak + start: {tpsf_decon_peak_ps:.4f} + {tpsf_start_ps:.4f} = {tpsf_peak_ps:.4f} ps")
-            # if irf_metadata_peak_ps is not None and irf_decon_peak_ps is not None:
-            #     irf_peak_diff = abs(irf_metadata_peak_ps - irf_decon_peak_ps)
-            #     if irf_peak_diff > 1.0:
-            #         print(f"  IRF metadata decon peak differs by {irf_peak_diff:.4f} ps")
-            # if tpsf_metadata_peak_ps is not None and tpsf_decon_peak_ps is not None:
-            #     tpsf_peak_diff = abs(tpsf_metadata_peak_ps - tpsf_decon_peak_ps)
-            #     if tpsf_peak_diff > 1.0:
-            #         print(f"  TPSF metadata decon peak differs by {tpsf_peak_diff:.4f} ps")
             if coherence_gate_ps is not None:
                 print(f"  Coherence gate: {coherence_gate_ps:.4f} ps")
             print(f"✓ Processed {folder_label}")
@@ -519,15 +820,24 @@ class SensitivityTestAnalyzer:
         except Exception as error:
             print(f"✗ Error: {error}")
 
+    # ------------------------------------------------------------------ #
+    # Top-level run + aggregation
+    # ------------------------------------------------------------------ #
     def run(self):
         print("\n" + "=" * 60)
         print("SENSITIVITY TEST ANALYSIS")
         print("=" * 60)
+        print(f"Stages: {self.stages}   Intensity correction: {self.correct_intensity}")
 
         measurement_folders = self.find_measurement_folders()
         if not measurement_folders:
             print("No SCOS_Single folders found")
             return
+
+        if self.correct_intensity:
+            # calibrate from Gated measurements before processing any folders,
+            # so the model can be applied to ISCOS/PaLS-iSCOS measurements too
+            self.calibrate_intensity_artifact()
 
         for folder in measurement_folders:
             self.process_measurement(folder, force_recalc=self.recalc_SCOS)
@@ -539,6 +849,8 @@ class SensitivityTestAnalyzer:
                 "method",
                 "measurement_type",
                 "measurement_index",
+                "stages",
+                "correct_intensity",
                 "time_gate_ps",
                 "coherence_gate_ps",
                 "gate_position_ps",
@@ -552,24 +864,38 @@ class SensitivityTestAnalyzer:
                 "baseline_std_rBFI",
                 "tourniquet_mean_rBFI",
                 "tourniquet_std_rBFI",
+                "late_mean_rBFI",
+                "late_std_rBFI",
                 "raw_baseline_mean_rBFI",
                 "raw_baseline_std_rBFI",
                 "raw_tourniquet_mean_rBFI",
                 "raw_tourniquet_std_rBFI",
+                "raw_late_mean_rBFI",
+                "raw_late_std_rBFI",
+                "intensity_ratio_R",
+                "correction_factor_rBFI",
+                "correction_factor_contrast",
                 "window_seconds",
+                "window_cut_transition_seconds",
                 "base_start_s",
                 "base_end_s",
+                "tourniquet_start_s",
+                "tourniquet_end_s",
                 "late_start_s",
                 "late_end_s",
                 "base_count",
+                "tourniquet_count",
                 "late_count",
                 "total_frames",
+                "baseline_mean_normalized",
+                "baseline_std_normalized",
+                "tourniquet_mean_normalized",
+                "tourniquet_std_normalized",
             ]
             df = df[[column for column in preferred_columns if column in df.columns]]
             df.to_csv(self.output_csv, index=False)
             print(f"\n✓ Summary saved to {self.output_csv}")
             try:
-                # compute per-method offset and aggregated statistics and plots
                 self.aggregate_and_plot(df)
             except Exception as err:
                 print(f"Warning: could not create aggregated summary/plots: {err}")
@@ -579,233 +905,120 @@ class SensitivityTestAnalyzer:
     def aggregate_and_plot(self, df):
         # Create offset column: Gated uses time_gate_ps, others use coherence_gate_ps
         df_work = df.copy()
-        df_work['offset_ps'] = np.where(df_work.get('method', '') == 'Gated', df_work.get('time_gate_ps'), df_work.get('coherence_gate_ps'))
-        # ensure numeric offsets
-        df_work['offset_ps'] = pd.to_numeric(df_work['offset_ps'], errors='coerce')
+        df_work["offset_ps"] = np.where(
+            df_work.get("method", "") == "Gated",
+            df_work.get("time_gate_ps"),
+            df_work.get("coherence_gate_ps"),
+        )
+        df_work["offset_ps"] = pd.to_numeric(df_work["offset_ps"], errors="coerce")
 
-        # If Gated rows lack `time_gate_ps`, try to reconstruct from `gate_position_ps`
-        # using the analyzer's inferred gate-1 reference time (if available).
+        # If Gated rows lack `time_gate_ps`, reconstruct from `gate_position_ps`
         try:
             t_ref = self.infer_time_gate_reference_ps()
             if t_ref is not None:
-                mask_fill = (df_work.get('method', '') == 'Gated') & df_work['offset_ps'].isna() & df_work['gate_position_ps'].notna()
+                mask_fill = (df_work.get("method", "") == "Gated") & df_work["offset_ps"].isna() & df_work["gate_position_ps"].notna()
                 if mask_fill.any():
-                    df_work.loc[mask_fill, 'offset_ps'] = pd.to_numeric(df_work.loc[mask_fill, 'gate_position_ps'], errors='coerce') - float(t_ref)
+                    df_work.loc[mask_fill, "offset_ps"] = pd.to_numeric(df_work.loc[mask_fill, "gate_position_ps"], errors="coerce") - float(t_ref)
         except Exception:
             pass
 
-        # Ensure we have a folder_path column; if missing, try to reconstruct from the `folder` text by searching base_path
-        if 'folder_path' not in df_work.columns:
-            df_work['folder_path'] = None
-            for idx, row in df_work.iterrows():
-                folder_text = row.get('folder', '')
-                parts = [p.strip() for p in str(folder_text).split('/') if p.strip()]
-                if not parts:
-                    continue
-                # expect something like 'parent / foldername'
-                if len(parts) >= 2:
-                    parent_name = parts[-2]
-                    folder_name = parts[-1]
-                else:
-                    parent_name = None
-                    folder_name = parts[-1]
-
-                try:
-                    candidates = list(self.base_path.rglob(folder_name))
-                except Exception:
-                    candidates = []
-
-                chosen = None
-                if candidates:
-                    if parent_name:
-                        for c in candidates:
-                            if c.parent.name == parent_name:
-                                chosen = c
-                                break
-                    if chosen is None:
-                        chosen = candidates[0]
-
-                if chosen is not None:
-                    df_work.at[idx, 'folder_path'] = str(chosen)
-
-        # place summary files next to the main output CSV so they are easy to find
         output_parent = Path(self.output_csv).parent if self.output_csv else Path(self.base_path)
         summary_folder = output_parent / "sensitivity_test_results_plots"
         summary_folder.mkdir(parents=True, exist_ok=True)
 
-        # For each (method, offset) collect baseline and late samples across all measurements
-        group = df_work.dropna(subset=['offset_ps', 'folder_path'])
+        group = df_work.dropna(subset=["offset_ps", "percentage_rBFI_difference"])
         if group.empty:
             print("No offset data available for aggregated summary")
             return
 
         sample_buckets = {}
         for _, row in group.iterrows():
-            method = row.get('method')
-            offset = float(row.get('offset_ps'))
-            folder_path = row.get('folder_path')
-            base_start = row.get('base_start_s')
-            base_end = row.get('base_end_s')
-            late_start = row.get('late_start_s')
-            late_end = row.get('late_end_s')
-            # try to load time series
-            try:
-                tp = Path(folder_path)
-                time_vec = np.asarray(self.load_npy(tp, 'time_vector.npy')).flatten()
-                k2_corrected = np.asarray(self.load_npy(tp, 'K2_corrected.npy')).flatten()
-            except Exception:
-                continue
-
-            # get raw baseline mean for normalization (from saved row or recompute)
-            if self.metric == 'rbfi':
-                baseline_mean = row.get('raw_baseline_mean_rBFI')
-            else:
-                baseline_mean = row.get('raw_baseline_mean_contrast')
-
-            # fallback: compute from data if missing
-            base_mask = (time_vec >= base_start) & (time_vec <= base_end)
-            if baseline_mean is None or not np.isfinite(baseline_mean) or baseline_mean == 0:
-                base_vals = k2_corrected[base_mask]
-                base_vals = base_vals[np.isfinite(base_vals)]
-                if base_vals.size:
-                    if self.metric == 'rbfi':
-                        # compute rbfi from k2: rbfi = 1 / (sqrt(K2))^2 = 1 / K2
-                        # but ensure non-negative and avoid divide-by-zero
-                        k2_vals = np.maximum(base_vals.astype(float), 0.0)
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            rbfi_vals = 1.0 / k2_vals
-                        rbfi_vals = rbfi_vals[np.isfinite(rbfi_vals)]
-                        baseline_mean = float(np.nanmean(rbfi_vals)) if rbfi_vals.size else np.nan
-                    else:
-                        # contrast fallback
-                        contrast_vals = np.sqrt(np.maximum(base_vals.astype(float), 0.0))
-                        baseline_mean = float(np.nanmean(contrast_vals)) if contrast_vals.size else np.nan
-
-            if not np.isfinite(baseline_mean) or baseline_mean == 0:
-                continue
-
-            # compute normalized series depending on metric
-            contrast = np.sqrt(np.maximum(k2_corrected.astype(float), 0.0))
-            if self.metric == 'rbfi':
-                rbfi_raw = self.calculate_corrected_rbfi(contrast)
-                normalized = self.normalize_to_baseline(rbfi_raw, baseline_mean)
-            else:
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    normalized = contrast / float(baseline_mean)
-                normalized[~np.isfinite(normalized)] = np.nan
-
-            # collect normalized samples
-            base_mask = (time_vec >= base_start) & (time_vec <= base_end)
-            late_mask = (time_vec >= late_start) & (time_vec <= late_end)
-            base_samples = normalized[base_mask]
-            late_samples = normalized[late_mask]
-            base_samples = base_samples[np.isfinite(base_samples)]
-            late_samples = late_samples[np.isfinite(late_samples)]
-
-            # compute folder-level statistics (treat this folder as one sample)
-            if base_samples.size == 0 or late_samples.size == 0:
-                continue
-            folder_baseline_mean = float(np.nanmean(base_samples))
-            folder_baseline_std = float(np.nanstd(base_samples))
-            folder_late_mean = float(np.nanmean(late_samples))
-            folder_late_std = float(np.nanstd(late_samples))
-            if not np.isfinite(folder_baseline_mean):
-                continue
-            # percentage change for this folder (mean of per-frame percent changes on normalized contrast)
-            folder_pct_samples = (late_samples - 1.0) * 100.0
-            folder_pct_mean = float(np.nanmean(folder_pct_samples)) if folder_pct_samples.size else np.nan
-
+            method = row.get("method")
+            offset = float(row.get("offset_ps"))
             key = (method, offset)
             sample_buckets.setdefault(key, []).append({
-                'pct_mean': folder_pct_mean,
-                'baseline_mean': folder_baseline_mean,
-                'baseline_std': folder_baseline_std,
-                'late_mean': folder_late_mean,
-                'late_std': folder_late_std,
-                'n_late': int(np.sum(np.isfinite(late_samples)))
+                "pct_mean": row.get("percentage_rBFI_difference"),
+                "baseline_mean": row.get("baseline_mean_normalized"),
+                "baseline_std": row.get("baseline_std_normalized"),
+                "tourniquet_mean": row.get("tourniquet_mean_normalized"),
+                "tourniquet_std": row.get("tourniquet_std_normalized"),
             })
 
-        # compute aggregated statistics per key
         rows = []
         for (method, offset), folder_list in sample_buckets.items():
-            if not folder_list:
-                continue
-            # treat each folder as one sample: use folder-level pct_mean values
-            folder_pct_means = np.array([f['pct_mean'] for f in folder_list if np.isfinite(f['pct_mean'])])
+            folder_pct_means = np.array([f["pct_mean"] for f in folder_list if np.isfinite(f["pct_mean"])])
             if folder_pct_means.size == 0:
                 continue
-            pct_mean = float(np.nanmean(folder_pct_means))
-            pct_std = float(np.nanstd(folder_pct_means))
-            pct_n = int(folder_pct_means.size)
 
-            baseline_means = np.array([f['baseline_mean'] for f in folder_list if np.isfinite(f['baseline_mean'])])
-            baseline_stds = np.array([f['baseline_std'] for f in folder_list if np.isfinite(f['baseline_std'])])
-            late_means = np.array([f['late_mean'] for f in folder_list if np.isfinite(f['late_mean'])])
-            late_stds = np.array([f['late_std'] for f in folder_list if np.isfinite(f['late_std'])])
+            baseline_means = np.array([f["baseline_mean"] for f in folder_list if np.isfinite(f["baseline_mean"])])
+            baseline_stds = np.array([f["baseline_std"] for f in folder_list if np.isfinite(f["baseline_std"])])
+            tourniquet_means = np.array([f["tourniquet_mean"] for f in folder_list if np.isfinite(f["tourniquet_mean"])])
+            tourniquet_stds = np.array([f["tourniquet_std"] for f in folder_list if np.isfinite(f["tourniquet_std"])])
 
             rows.append({
-                'method': method,
-                'offset_ps': offset,
-                'percentage_mean': pct_mean,
-                'percentage_std': pct_std,
-                'percentage_n': pct_n,
-                'baseline_mean_rBFI': float(np.nanmean(baseline_means)) if baseline_means.size else np.nan,
-                'baseline_std_rBFI': float(np.nanmean(baseline_stds)) if baseline_stds.size else np.nan,
-                'tourniquet_mean_rBFI': float(np.nanmean(late_means)) if late_means.size else np.nan,
-                'tourniquet_std_rBFI': float(np.nanmean(late_stds)) if late_stds.size else np.nan,
+                "method": method,
+                "offset_ps": offset,
+                "percentage_mean": float(np.nanmean(folder_pct_means)),
+                "percentage_std": float(np.nanstd(folder_pct_means)),
+                "percentage_n": int(folder_pct_means.size),
+                "baseline_mean_rBFI": float(np.nanmean(baseline_means)) if baseline_means.size else np.nan,
+                "baseline_std_rBFI": float(np.nanmean(baseline_stds)) if baseline_stds.size else np.nan,
+                "tourniquet_mean_rBFI": float(np.nanmean(tourniquet_means)) if tourniquet_means.size else np.nan,
+                "tourniquet_std_rBFI": float(np.nanmean(tourniquet_stds)) if tourniquet_stds.size else np.nan,
             })
 
         if not rows:
-            print('No aggregated samples found')
+            print("No aggregated samples found")
             return
 
         agg = pd.DataFrame(rows)
-
         summary_csv = output_parent / "sensitivity_test_results_summary.csv"
         agg.to_csv(summary_csv, index=False)
         print(f"✓ Aggregated summary saved to {summary_csv}")
 
+        y_label = "Percentage rBFI difference (%)" if self.metric == "rbfi" else "Percentage contrast difference (%)"
+
         # Per-method subplot
-        methods = agg['method'].unique().tolist()
+        methods = agg["method"].unique().tolist()
         n = max(1, len(methods))
         fig, axs = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
         for i, method in enumerate(methods):
             ax = axs[0, i]
-            rows = agg[agg['method'] == method].sort_values('offset_ps')
-            if rows.empty:
+            rows_m = agg[agg["method"] == method].sort_values("offset_ps")
+            if rows_m.empty:
                 continue
-            x = rows['offset_ps'].astype(float).values
-            y = rows['percentage_mean'].values
-            yerr = rows['percentage_std'].fillna(0).values
-            ax.errorbar(x, y, yerr=yerr, fmt='-o', capsize=3)
+            x = rows_m["offset_ps"].astype(float).values
+            y = rows_m["percentage_mean"].values
+            yerr = rows_m["percentage_std"].fillna(0).values
+            ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3)
             ax.set_title(method)
-            ax.set_xlabel('Offset (ps)')
-            ax.set_ylabel('Percentage rBFI difference (%)')
+            ax.set_xlabel("Offset (ps)")
+            ax.set_ylabel(y_label)
             ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        out1 = summary_folder / 'sensitivity_summary_by_method.png'
-        plt.savefig(out1, dpi=150, bbox_inches='tight')
+        out1 = summary_folder / "sensitivity_summary_by_method.png"
+        plt.savefig(out1, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"✓ Saved per-method sensitivity plot to {out1}")
 
         # Combined overlay plot
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
         for method in methods:
-            rows = agg[agg['method'] == method].sort_values('offset_ps')
-            if rows.empty:
+            rows_m = agg[agg["method"] == method].sort_values("offset_ps")
+            if rows_m.empty:
                 continue
-            x = rows['offset_ps'].astype(float).values
-            y = rows['percentage_mean'].values
-            yerr = rows['percentage_std'].fillna(0).values
-            ax.errorbar(x, y, yerr=yerr, fmt='-o', capsize=3, label=method)
-        ax.set_xlabel('Offset (ps)')
-        ax.set_ylabel('Percentage rBFI difference (%)')
-        ax.set_title('Sensitivity summary (all methods)')
+            x = rows_m["offset_ps"].astype(float).values
+            y = rows_m["percentage_mean"].values
+            yerr = rows_m["percentage_std"].fillna(0).values
+            ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method)
+        ax.set_xlabel("Offset (ps)")
+        ax.set_ylabel(y_label)
+        ax.set_title("Sensitivity summary (all methods)")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best')
+        ax.legend(loc="best")
         plt.tight_layout()
-        out2 = summary_folder / 'sensitivity_summary_by_method_combined.png'
-        plt.savefig(out2, dpi=150, bbox_inches='tight')
+        out2 = summary_folder / "sensitivity_summary_by_method_combined.png"
+        plt.savefig(out2, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"✓ Saved combined sensitivity plot to {out2}")
 
@@ -822,21 +1035,47 @@ if __name__ == "__main__":
         if window_index + 1 < len(sys.argv):
             window_seconds = float(sys.argv[window_index + 1])
 
+    window_cut_transition_seconds = 5.0
+    if "--transition" in sys.argv:
+        transition_index = sys.argv.index("--transition")
+        if transition_index + 1 < len(sys.argv):
+            window_cut_transition_seconds = float(sys.argv[transition_index + 1])
+
     # metric selection: 'contrast' (default) or 'rbfi'
-    metric_arg = 'contrast'
-    if '--metric' in sys.argv:
-        mi = sys.argv.index('--metric')
+    metric_arg = "contrast"
+    if "--metric" in sys.argv:
+        mi = sys.argv.index("--metric")
         if mi + 1 < len(sys.argv):
             metric_arg = sys.argv[mi + 1].lower()
 
+    # stages: 2 (default) or 3
+    stages_arg = 2
+    if "--stages" in sys.argv:
+        si = sys.argv.index("--stages")
+        if si + 1 < len(sys.argv):
+            stages_arg = int(sys.argv[si + 1])
+
+    # intensity correction: off by default, opt in with --correct-intensity
+    correct_intensity_arg = "--correct-intensity" in sys.argv
+
     output_csv = str(Path(base_path) / "sensitivity_test_results.csv")
+    
+    print(f"Running sensitivity test analysis on base path: {base_path}")
+    print(f"  Recalculate SCOS: {recalc_scos}")
+    print(f"  Window seconds: {window_seconds}")
+    print(f"  Window cut transition seconds: {window_cut_transition_seconds}")
+    print(f"  Metric: {metric_arg}")
+    print(f"  Stages: {stages_arg}")
+    print(f"  Correct intensity: {correct_intensity_arg}")
+    
     analyzer = SensitivityTestAnalyzer(
         base_path,
         output_csv=output_csv,
         recalc_SCOS=recalc_scos,
         window_seconds=window_seconds,
+        window_cut_transition_seconds=window_cut_transition_seconds,
         metric=metric_arg,
+        stages=stages_arg,
+        correct_intensity=correct_intensity_arg,
     )
     analyzer.run()
-
-    
